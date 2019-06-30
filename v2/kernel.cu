@@ -10,6 +10,7 @@
 #include <string>
 #include <string.h>
 #include <vector>
+#include <omp.h>
 #include "dirent.h"
 
 using namespace std;
@@ -161,6 +162,19 @@ double LAD2(double* wave1, double* wave2, int size) {
 	return difference;
 }
 
+double LADOMP(double* wave1, double* wave2, int size) {
+	//wave1 += size1 / 2;
+	//wave2 += size2 / 2;
+	int length = (int)fmin(size, 22050);
+	double difference = 0;
+	#pragma omp parallel for reduction(+: difference)
+	for (int i = 0; i < length; i++) {
+		difference += fabs(wave2[i] - wave1[i]);
+		//printf("%d- %lf %lf\n", i, wave1[i], wave2[i]);
+	}
+	return difference;
+}
+
 struct Music initMusic(string address) {
 	struct Music result;
 	result.address = address;
@@ -182,17 +196,17 @@ struct Music initMusic2(string address, int size) {
 int addFiles(vector<struct Music> &vec, char directory[], int size) {
 	DIR *dir;
 	struct dirent *ent;
-	printf("chunk size:%d\n", size);
+	//printf("chunk size:%d\n", size);
 	if ((dir = opendir(directory)) != NULL) {
 		/* print all the files and directories within directory */
 		while ((ent = readdir(dir)) != NULL) {
 			if (((string)ent->d_name).find(".txt") != std::string::npos) {
 				cout << concat(directory,ent->d_name) << " ";
 				int fullSize = numberOfWords(concat(directory, ent->d_name));
-				printf("size:%d\n", fullSize);
+				//printf("size:%d\n", fullSize);
 				cufftComplex * full = fillFromFile(concat(directory, ent->d_name), fullSize);
 				for (int i = 0; i <= fullSize - size; i = i + size) {
-					printf("offset:%d-%d\n", i, i + size);
+					//printf("offset:%d-%d\n", i, i + size);
 					struct Music aChunk;
 					aChunk.address = concat(directory, ent->d_name);
 					aChunk.powerSpectrum = audioFilePowerSpectrum3(full + i, size);
@@ -238,6 +252,7 @@ int sampleCount(char address[]) {
 
 int main(int argc, char **argv)
 {
+	
 	printf("%s\n", argv[1]);
 	printf("%s\n", argv[2]);
 
@@ -259,9 +274,9 @@ int main(int argc, char **argv)
 	double minLAD, newLAD;
 	for (int i = 0; i < samples.size(); i++) {
 		minId = 0;
-		minLAD = LAD2(samples[i].powerSpectrum, full[0].powerSpectrum, numberOfWords(samples[i].address));
+		minLAD = LADOMP(samples[i].powerSpectrum, full[0].powerSpectrum, numberOfWords(samples[i].address));
 		for (int j = 1; j < full.size(); j++) {
-			newLAD = LAD2(samples[i].powerSpectrum, full[j].powerSpectrum, numberOfWords(samples[i].address));
+			newLAD = LADOMP(samples[i].powerSpectrum, full[j].powerSpectrum, numberOfWords(samples[i].address));
 			cout << samples[i].address << "-" << full[j].address;
 			printf(": %lf\n",newLAD);
 			if (newLAD < minLAD) {
@@ -282,8 +297,9 @@ int main(int argc, char **argv)
 	double b[arraySize] = { 10.0, 20.0, 30.0, 40.0, 50.0 };
 	double c[arraySize] = { 0 };
 
-	printf("%lf", LAD2(a, b, 5));
+	printf("%lf", LADOMP(a, b, 5));
 	*/
+	
 
 
 	
