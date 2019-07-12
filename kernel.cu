@@ -8,7 +8,9 @@
 #include <iomanip>
 #include <fstream>
 #include <string>
+#include <string.h>
 #include <vector>
+#include <omp.h>
 #include "dirent.h"
 
 using namespace std;
@@ -17,6 +19,26 @@ struct Music {
 	string address;
 	double *powerSpectrum;
 };
+
+cudaError_t diff(double *c, const double *a, const double *b, unsigned int size);
+
+__global__ void diffKernel(double *c, const double *a, const double *b,int size)
+{
+	int i = blockDim.x * blockIdx.x + threadIdx.x;
+	if (i < size) {
+		c[i] = a[i] - b[i];
+		if (c[i] < 0) {
+			c[i] = -c[i];
+		}
+	}
+}
+
+string concat(char x[], char y[]) {
+	char result[200];   // array to hold the result.
+
+	strcpy(result, x); // copy string one into the result.
+	return strcat(result, y); // append string two to the result.
+}
 
 void dft(int size, cufftComplex * input, cufftComplex * output) {
 	cufftHandle plan;
@@ -33,8 +55,9 @@ void dft(int size, cufftComplex * input, cufftComplex * output) {
 }
 
 double* powerSpecterum(int size, cufftComplex * wave) {
-	double * result = (double*) malloc(size * sizeof(double));
+	double * result = (double*)malloc(size * sizeof(double));
 	//size = size / 2 + 1;
+	#pragma omp parallel for
 	for (int i = 0; i < size; i++) {
 		result[i] = wave[i].x * wave[i].x + wave[i].y * wave[i].y;
 	}
@@ -47,7 +70,7 @@ int numberOfWords(string name) {
 	ifstream inFile;
 	inFile.open(name);
 	if (!inFile) {
-		cout << "Unable to open file";
+		cout << "Unable to open file " << name;
 		exit(1); // terminate with error
 	}
 
@@ -97,11 +120,55 @@ double * audioFilePowerSpectrum2(string name, int fileWordCount) {
 	return powerSpecterum(fileWordCount, output);
 }
 
+double * audioFilePowerSpectrum3(cufftComplex * input, int fileWordCount) {
+	cufftComplex *output;
+	output = (cufftComplex*)malloc(fileWordCount * sizeof(cufftComplex));
+	dft(fileWordCount, input, output);
+	return powerSpecterum(fileWordCount, output);
+}
+
 double LAD(double* wave1, double* wave2, int size) {
 	//wave1 += size1 / 2;
 	//wave2 += size2 / 2;
 	int length = (int)fmin(size, 22050);
 	double difference = 0;
+	for (int i = 0; i < length; i++) {
+		difference += fabs(wave2[i] - wave1[i]);
+		//printf("%d- %lf %lf\n", i, wave1[i], wave2[i]);
+	}
+	return difference;
+}
+
+double LAD2(double* wave1, double* wave2, int size) {
+	int length = (int)fmin(size, 22050);
+	double c[22050] = { 0 };
+	cudaError_t cudaStatus  = diff(c, wave1, wave2, length);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "addWithCuda failed!");
+		return 1;
+	}
+
+	// cudaDeviceReset must be called before exiting in order for profiling and
+	// tracing tools such as Nsight and Visual Profiler to show complete traces.
+	cudaStatus = cudaDeviceReset();
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaDeviceReset failed!");
+		return 1;
+	}
+	double difference = 0;
+	for (int i = 0; i < length; i++) {
+		difference += c[i];
+		//printf("%d- %lf %lf\n", i, wave1[i], wave2[i]);
+	}
+	return difference;
+}
+
+double LADOMP(double* wave1, double* wave2, int size) {
+	//wave1 += size1 / 2;
+	//wave2 += size2 / 2;
+	int length = (int)fmin(size, 22050);
+	double difference = 0;
+	#pragma omp parallel for reduction(+: difference)
 	for (int i = 0; i < length; i++) {
 		difference += fabs(wave2[i] - wave1[i]);
 		//printf("%d- %lf %lf\n", i, wave1[i], wave2[i]);
@@ -121,21 +188,34 @@ struct Music initMusic2(string address, int size) {
 	struct Music result;
 	result.address = address;
 	//result.powerSpectrum = audioFilePowerSpectrum(address);
-	result.powerSpectrum = audioFilePowerSpectrum2(address,size);
+	result.powerSpectrum = audioFilePowerSpectrum2(address, size);
 	return result;
 }
 
-int addFiles(vector<struct Music> &vec, char directory[],int size) {
+
+
+int addFiles(vector<struct Music> &vec, char directory[], int size) {
 	DIR *dir;
 	struct dirent *ent;
+	//printf("chunk size:%d\n", size);
 	if ((dir = opendir(directory)) != NULL) {
 		/* print all the files and directories within directory */
 		while ((ent = readdir(dir)) != NULL) {
 			if (((string)ent->d_name).find(".txt") != std::string::npos) {
-				printf("%s\n", ent->d_name);
-				vec.push_back(initMusic2(ent->d_name,size));
+				cout << concat(directory,ent->d_name) << " ";
+				int fullSize = numberOfWords(concat(directory, ent->d_name));
+				//printf("size:%d\n", fullSize);
+				cufftComplex * full = fillFromFile(concat(directory, ent->d_name), fullSize);
+				for (int i = 0; i <= fullSize - size; i = i + size) {
+					//printf("offset:%d-%d\n", i, i + size);
+					struct Music aChunk;
+					aChunk.address = concat(directory, ent->d_name);
+					aChunk.powerSpectrum = audioFilePowerSpectrum3(full + i, size);
+					vec.push_back(aChunk);
+				}
 			}
 		}
+		printf("\n\n");
 		closedir(dir);
 	}
 	else {
@@ -146,13 +226,18 @@ int addFiles(vector<struct Music> &vec, char directory[],int size) {
 }
 
 int sampleCount(char address[]) {
+	int min = 10000000;
 	DIR *dir;
 	struct dirent *ent;
 	if ((dir = opendir(address)) != NULL) {
 		/* print all the files and directories within directory */
 		while ((ent = readdir(dir)) != NULL) {
 			if (((string)ent->d_name).find(".txt") != std::string::npos) {
-				return(numberOfWords(ent->d_name));
+				int newMin = numberOfWords(concat(address, ent->d_name));
+				printf("%d\n", newMin);
+				if (min > newMin) {
+					min = newMin;
+				}
 			}
 		}
 		closedir(dir);
@@ -162,126 +247,148 @@ int sampleCount(char address[]) {
 		perror("");
 		return EXIT_FAILURE;
 	}
+	return min;
 }
 
-int main()
+
+int main(int argc, char **argv)
 {
-	//double *samplePower = audioFilePowerSpectrum("audio.txt");
-	//double *fullPower = audioFilePowerSpectrum("audio2.txt");
-	// double *anotherFullPower = audioFilePowerSpectrum("Ehaam-Darya-128.txt");
-
-	/*
-	int size = 200;
-	int size2 = 100;
-	cufftComplex *input = (cufftComplex*)malloc(size * sizeof(cufftComplex));
-	cufftComplex *input2 = (cufftComplex*)malloc(size2 * sizeof(cufftComplex));
-
-	for (int i = 0; i < size; i++) {
-		input[i].x = 1;
-		input[i].y = 0;
-	}
-
-	for (int i = 0; i < size2; i++) {
-		input2[i].x = 1;
-		input2[i].y = 0;
-	}
-
-	cufftComplex *output;
-	cufftComplex *output2;
-
-	output = (cufftComplex*)malloc(size * sizeof(cufftComplex));
-	output2 = (cufftComplex*)malloc(size2 * sizeof(cufftComplex));
-
-	dft(size, input, output);
-	dft(size2, input2, output2);
-
-	double * pow1 = powerSpecterum(size, output);
-
-	double * pow2 = powerSpecterum(size2, output2);
-
 	
-	printf("%lf", LAD(pow1, pow2, size, size2));
-	*/
+	printf("%s\n", argv[1]);
+	printf("%s\n", argv[2]);
+	omp_set_num_threads(4);
+	//printf("Number of threads = %d\n", omp_get_num_threads());
 
 
+	char * sample_directory = argv[2];
 
 
-	char sample_directory[] = "sample\\";
-	
-	
 	vector<struct Music> samples;
 	vector<struct Music> full;
 
 	int count = sampleCount(sample_directory);
-	addFiles(samples, sample_directory,count);
-	addFiles(full, "full\\",count);
+	addFiles(samples, sample_directory, count);
+	addFiles(full, argv[1], count);
 
 
 
 
-	/*
-	samples.push_back(initMusic2("1s.txt",numberOfWords("1s.txt")));
-	samples.push_back(initMusic2("2s.txt", numberOfWords("2s.txt")));
-	samples.push_back(initMusic2("3s.txt", numberOfWords("3s.txt")));
-	samples.push_back(initMusic2("4s.txt", numberOfWords("4s.txt")));
-	*/
-	
-
-
-
-	/*
-	full.push_back(initMusic2("1.txt", numberOfWords("1s.txt")));
-	full.push_back(initMusic2("2.txt", numberOfWords("2s.txt")));
-	full.push_back(initMusic2("3.txt", numberOfWords("3s.txt")));
-	full.push_back(initMusic2("4.txt", numberOfWords("4s.txt")));
-	*/
-
-
+	int minId;
+	double minLAD, newLAD;
 	for (int i = 0; i < samples.size(); i++) {
-		for (int j = 0; j < full.size(); j++) {
+		minId = 0;
+		minLAD = LADOMP(samples[i].powerSpectrum, full[0].powerSpectrum, numberOfWords(samples[i].address));
+		for (int j = 1; j < full.size(); j++) {
+			newLAD = LADOMP(samples[i].powerSpectrum, full[j].powerSpectrum, numberOfWords(samples[i].address));
 			cout << samples[i].address << "-" << full[j].address;
-			printf("- %lf\n" ,LAD(samples[i].powerSpectrum, full[j].powerSpectrum, numberOfWords(samples[i].address)));
+			printf(": %lf\n",newLAD);
+			if (newLAD < minLAD) {
+				minId = j;
+				minLAD = newLAD;
+			}
 		}
 		printf("\n");
-	}
+		cout << samples[i].address << " >>> " << full[minId].address;
+		printf("\n");
 
+	}
 	
 
 	/*
-	printf("%lf\n", LAD(samples[0].powerSpectrum, full[0].powerSpectrum, numberOfWords(samples[0].address)));
-    printf("%lf\n", LAD(samples[0].powerSpectrum, full[1].powerSpectrum, numberOfWords(samples[0].address)));
-	printf("%lf\n\n", LAD(samples[0].powerSpectrum, full[2].powerSpectrum, numberOfWords(samples[0].address)));
+	const int arraySize = 5;
+	double a[arraySize] = { 1.0, 2.0, 3.0, 4.0, 5.0 };
+	double b[arraySize] = { 10.0, 20.0, 30.0, 40.0, 50.0 };
+	double c[arraySize] = { 0 };
+
+	printf("%lf", LADOMP(a, b, 5));
+	*/
+	
+
 
 	
-	printf("%lf\n", LAD(samples[1].powerSpectrum, full[0].powerSpectrum, numberOfWords(samples[1].address)));
-	printf("%lf\n", LAD(samples[1].powerSpectrum, full[1].powerSpectrum, numberOfWords(samples[1].address)));
-	printf("%lf\n\n", LAD(samples[1].powerSpectrum, full[2].powerSpectrum, numberOfWords(samples[1].address)));
 
-	printf("%lf\n", LAD(samples[2].powerSpectrum, full[0].powerSpectrum, numberOfWords(samples[2].address)));
-	printf("%lf\n", LAD(samples[2].powerSpectrum, full[1].powerSpectrum, numberOfWords(samples[2].address)));
-	printf("%lf\n\n", LAD(samples[2].powerSpectrum, full[2].powerSpectrum, numberOfWords(samples[2].address)));
 
-	*/
-
-	/*
-	cudaSetDevice(0);
-	cufftComplex *input, *output;
-	int size = 100;
-	input = (cufftComplex*)malloc(size * sizeof(cufftComplex));
-	output = (cufftComplex*)malloc(size * sizeof(cufftComplex));
-
-	for (int i = 0; i < size; i++) {
-		input[i].x = (float)cos(3.14 + 3.14 * i);
-		input[i].y = 0;
-	}
-
-	dft(size, input, output);
-	double* power = powerSpecterum(size, output);
-
-	for (int i = 0; i < size; i++) {
-		printf("%d- %f^2 + %f^2 = %f \n",i,output[i].x, output[i].y, power[i]);
-	}
-	*/
-
-    return 0;
+	return 0;
 }
+
+
+// Helper function for using CUDA to add vectors in parallel.
+cudaError_t diff(double *c, const double *a, const double *b, unsigned int size)
+{
+	double *dev_a = 0;
+	double *dev_b = 0;
+	double *dev_c = 0;
+	cudaError_t cudaStatus;
+
+	// Choose which GPU to run on, change this on a multi-GPU system.
+	cudaStatus = cudaSetDevice(0);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaSetDevice failed!  Do you have a CUDA-capable GPU installed?");
+		goto Error;
+	}
+
+	// Allocate GPU buffers for three vectors (two input, one output)    .
+	cudaStatus = cudaMalloc((void**)&dev_c, size * sizeof(double));
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed!");
+		goto Error;
+	}
+
+	cudaStatus = cudaMalloc((void**)&dev_a, size * sizeof(double));
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed!");
+		goto Error;
+	}
+
+	cudaStatus = cudaMalloc((void**)&dev_b, size * sizeof(double));
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed!");
+		goto Error;
+	}
+
+	// Copy input vectors from host memory to GPU buffers.
+	cudaStatus = cudaMemcpy(dev_a, a, size * sizeof(double), cudaMemcpyHostToDevice);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMemcpy failed!");
+		goto Error;
+	}
+
+	cudaStatus = cudaMemcpy(dev_b, b, size * sizeof(double), cudaMemcpyHostToDevice);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMemcpy failed!");
+		goto Error;
+	}
+
+	// Launch a kernel on the GPU with one thread for each element.
+	diffKernel << <ceil(size/1024.0), 1024 >> >(dev_c, dev_a, dev_b,(int)size);
+
+	// Check for any errors launching the kernel
+	cudaStatus = cudaGetLastError();
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "addKernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
+		goto Error;
+	}
+
+	// cudaDeviceSynchronize waits for the kernel to finish, and returns
+	// any errors encountered during the launch.
+	cudaStatus = cudaDeviceSynchronize();
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching addKernel!\n", cudaStatus);
+		goto Error;
+	}
+
+	// Copy output vector from GPU buffer to host memory.
+	cudaStatus = cudaMemcpy(c, dev_c, size * sizeof(double), cudaMemcpyDeviceToHost);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMemcpy failed!");
+		goto Error;
+	}
+
+Error:
+	cudaFree(dev_c);
+	cudaFree(dev_a);
+	cudaFree(dev_b);
+
+	return cudaStatus;
+}
+
